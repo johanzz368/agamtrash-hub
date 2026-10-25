@@ -9143,6 +9143,13 @@ function Runtime:_notifyLocked(code: string?)
 end
 
 function Runtime:_notifyFailure(title: string, code: string?)
+    -- The window is usable while the first handshake is still in flight. A click
+    -- during that short window is not a lock state, so do not raise a popup for
+    -- it; the Settings > Environment status updates when the handshake finishes.
+    if code == "ENVIRONMENT_NOT_READY" or code == "SERVER_NOT_READY" then
+        self.diagnostics:info("Feature action ignored until the environment handshake completes.")
+        return
+    end
     if code and LOCK_CODES[code] then
         self:_notifyLocked(code)
     else
