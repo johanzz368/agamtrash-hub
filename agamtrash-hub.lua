@@ -6721,12 +6721,16 @@ local Boot = {}
 local GUARD_NAME = "AgamtrashHubV1"
 
 local function environment(): table?
-    if type(getgenv) ~= "function" then
-        return nil
+    if type(getgenv) == "function" then
+        local ok, value = pcall(getgenv)
+        if ok and type(value) == "table" then
+            return value
+        end
     end
-    local ok, value = pcall(getgenv)
-    if ok and type(value) == "table" then
-        return value
+    -- Executors without getgenv can still share _G across runs, so the
+    -- single-run guard must look there before creating a second interface.
+    if type(_G) == "table" then
+        return _G
     end
     return nil
 end
@@ -9761,7 +9765,10 @@ UIController.__index = UIController
 local WINDOW_NAME = "agamtrash.hub"
 local WINDOW_SUBTITLE = "Fight in a Supermarket"
 local STATUS_TASK = "ui.status.refresh"
-local TOGGLE_KEY = Enum.KeyCode.Insert
+local TOGGLE_KEYS = {
+    [Enum.KeyCode.Insert] = true,
+    [Enum.KeyCode.RightControl] = true,
+}
 local UNLOAD_KEY = Enum.KeyCode.Delete
 
 local function text(value: any, maximum: number?): string
@@ -10048,7 +10055,7 @@ function UIController:_bindWindowHotkeys()
             if self._destroyed or processed then
                 return
             end
-            if input.KeyCode == TOGGLE_KEY then
+            if TOGGLE_KEYS[input.KeyCode] then
                 self:_toggleWindow()
             elseif input.KeyCode == UNLOAD_KEY then
                 self:_requestUnload()
@@ -10386,7 +10393,7 @@ function UIController:_buildSettings(tab: any)
         tab,
         "windowControls",
         "Window controls",
-        "A floating Hide / Close bar stays available at the top of the screen. Insert hides or shows the hub. Delete unloads it and cleans up every module."
+        "A floating Hide / Close bar stays available at the top of the screen. Insert or RightControl hides or shows the hub. Delete unloads it and cleans up every module."
     )
     self:_button(tab, "Hide Hub (Insert)", function()
         self:_setWindowVisible(false)
