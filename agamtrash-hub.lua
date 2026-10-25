@@ -9747,7 +9747,9 @@ __modules["Client.UIController"] = function()
 --
 -- Labels and diagnostics are bounded and sanitized before they reach Rayfield.
 
+local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
 
 local Protocol = __require("Shared.Protocol")
 local Theme = __require("Shared.Theme")
@@ -9759,9 +9761,62 @@ UIController.__index = UIController
 local WINDOW_NAME = "agamtrash.hub"
 local WINDOW_SUBTITLE = "Fight in a Supermarket"
 local STATUS_TASK = "ui.status.refresh"
+local TOGGLE_KEY = Enum.KeyCode.Insert
+local UNLOAD_KEY = Enum.KeyCode.Delete
 
 local function text(value: any, maximum: number?): string
     return Validation.cleanText(tostring(value or ""), maximum or 240) or ""
+end
+
+-- Rayfield's topbar icons are drawn by an executor-loaded asset and are too small
+-- (or unreachable when the game locks the mouse) on some clients. This dedicated
+-- ScreenGui keeps two large window controls outside that asset, above the hub.
+local function interfaceParent(): Instance?
+    if type(gethui) == "function" then
+        local ok, container = pcall(gethui)
+        if ok and typeof(container) == "Instance" then
+            return container
+        end
+    end
+    local ok, container = pcall(function()
+        return game:GetService("CoreGui")
+    end)
+    if ok and typeof(container) == "Instance" then
+        return container
+    end
+    local player = Players.LocalPlayer
+    if player then
+        return player:FindFirstChildOfClass("PlayerGui")
+    end
+    return nil
+end
+
+local function controlButton(parent: Instance, label: string, width: number, color: Color3): TextButton
+    local button = Instance.new("TextButton")
+    button.Name = label .. "Button"
+    button.Size = UDim2.fromOffset(width, 28)
+    button.BackgroundColor3 = color
+    button.BackgroundTransparency = 0.1
+    button.BorderSizePixel = 0
+    button.AutoButtonColor = true
+    button.Text = label
+    button.TextColor3 = Color3.fromRGB(240, 246, 255)
+    button.TextSize = 13
+    button.Font = Enum.Font.GothamBold
+    button.ZIndex = 2
+    button.Parent = parent
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 6)
+    corner.Parent = button
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(70, 110, 160)
+    stroke.Thickness = 1
+    stroke.Transparency = 0.25
+    stroke.Parent = button
+
+    return button
 end
 
 local function dropdownValue(option: any): string?
@@ -9805,6 +9860,8 @@ function UIController.new(runtime: any, library: any, options: any?): (any?, str
     self._configSliders = {}
     self._configDropdowns = {}
     self._itemCategory = nil
+    self._controls = nil
+    self._inputConnection = nil
 
     local ok, err = pcall(function()
         self:_createWindow()
@@ -9812,6 +9869,8 @@ function UIController.new(runtime: any, library: any, options: any?): (any?, str
         self:_buildCombat(self._tabs.Combat)
         self:_buildMisc(self._tabs.Misc)
         self:_buildSettings(self._tabs.Settings)
+        self:_createWindowControls()
+        self:_bindWindowHotkeys()
     end)
     if not ok then
         self._destroyed = true
@@ -9863,6 +9922,141 @@ function UIController:_createWindow()
         if type(self._tabs[name]) ~= "table" then
             error("Rayfield could not create the " .. name .. " tab.")
         end
+    end
+end
+
+function UIController:_windowVisible(): boolean
+    local ok, value = pcall(self._library.IsVisible, self._library)
+    if ok and type(value) == "boolean" then
+        return value
+    end
+    return true
+end
+
+function UIController:_syncWindowControls()
+    local controls = self._controls
+    if not controls then
+        return
+    end
+    controls.toggle.Text = self:_windowVisible() and "Hide (Insert)" or "Show (Insert)"
+end
+
+function UIController:_setWindowVisible(visible: boolean)
+    if self._destroyed then
+        return
+    end
+    task.spawn(function()
+        local ok, err = pcall(function()
+            if self._destroyed then
+                return
+            end
+            self._library:SetVisibility(visible == true)
+        end)
+        if not ok then
+            self:_internalError(err)
+        end
+        self:_syncWindowControls()
+    end)
+end
+
+function UIController:_toggleWindow()
+    if self._destroyed then
+        return
+    end
+    self:_setWindowVisible(not self:_windowVisible())
+end
+
+function UIController:_createWindowControls()
+    local parent = interfaceParent()
+    if not parent then
+        return
+    end
+
+    local screen
+    local ok, err = pcall(function()
+        screen = Instance.new("ScreenGui")
+        screen.Name = "AgamtrashHubControls"
+        screen.ResetOnSpawn = false
+        screen.IgnoreGuiInset = true
+        screen.DisplayOrder = 1000000
+        screen.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+        local bar = Instance.new("Frame")
+        bar.Name = "Bar"
+        bar.AnchorPoint = Vector2.new(0.5, 0)
+        bar.Position = UDim2.new(0.5, 0, 0, 8)
+        bar.Size = UDim2.fromOffset(258, 36)
+        bar.BackgroundColor3 = Color3.fromRGB(16, 21, 28)
+        bar.BackgroundTransparency = 0.15
+        bar.BorderSizePixel = 0
+        bar.ZIndex = 1
+        bar.Parent = screen
+
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 10)
+        corner.Parent = bar
+
+        local stroke = Instance.new("UIStroke")
+        stroke.Color = Color3.fromRGB(60, 80, 105)
+        stroke.Thickness = 1
+        stroke.Transparency = 0.2
+        stroke.Parent = bar
+
+        local layout = Instance.new("UIListLayout")
+        layout.FillDirection = Enum.FillDirection.Horizontal
+        layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+        layout.VerticalAlignment = Enum.VerticalAlignment.Center
+        layout.Padding = UDim.new(0, 6)
+        layout.SortOrder = Enum.SortOrder.LayoutOrder
+        layout.Parent = bar
+
+        local toggle = controlButton(bar, "Hide (Insert)", 118, Color3.fromRGB(27, 48, 73))
+        toggle.LayoutOrder = 1
+        local close = controlButton(bar, "Close", 110, Color3.fromRGB(82, 30, 36))
+        close.LayoutOrder = 2
+
+        toggle.MouseButton1Click:Connect(function()
+            self:_toggleWindow()
+        end)
+        close.MouseButton1Click:Connect(function()
+            self:_requestUnload()
+        end)
+
+        screen.Parent = parent
+        self._controls = { screen = screen, toggle = toggle, close = close }
+    end)
+
+    if not ok then
+        if screen then
+            pcall(function()
+                screen:Destroy()
+            end)
+        end
+        self._controls = nil
+        pcall(function()
+            self._runtime:getDiagnosticsLogger():warn("Window controls unavailable: " .. Validation.truncate(err, 160))
+        end)
+        return
+    end
+
+    self:_syncWindowControls()
+end
+
+function UIController:_bindWindowHotkeys()
+    local ok, connection = pcall(function()
+        return UserInputService.InputBegan:Connect(function(input, processed)
+            if self._destroyed or processed then
+                return
+            end
+            if input.KeyCode == TOGGLE_KEY then
+                self:_toggleWindow()
+            elseif input.KeyCode == UNLOAD_KEY then
+                self:_requestUnload()
+            end
+        end)
+    end)
+    if ok then
+        self._inputConnection = connection
     end
 end
 
@@ -10190,6 +10384,15 @@ function UIController:_buildSettings(tab: any)
     tab:CreateSection("Session")
     self:_paragraph(
         tab,
+        "windowControls",
+        "Window controls",
+        "A floating Hide / Close bar stays available at the top of the screen. Insert hides or shows the hub. Delete unloads it and cleans up every module."
+    )
+    self:_button(tab, "Hide Hub (Insert)", function()
+        self:_setWindowVisible(false)
+    end)
+    self:_paragraph(
+        tab,
         "resetNotice",
         "Session-only configuration",
         "Configuration is never written to disk. Reset restores defaults and stops all modules; no feature is auto-started."
@@ -10282,6 +10485,7 @@ function UIController:refreshStatus()
         self:_setStatus("noclipStatus", "Noclip status", snapshot.noclip)
         self:_setStatus("environmentStatus", "Environment", snapshot.environment .. "\n" .. snapshot.environmentDetail)
         self:_setStatus("moduleStatus", "Module status", snapshot.modules)
+        self:_syncWindowControls()
     end)
     if not ok then
         self._runtime:getDiagnosticsLogger():warn("Status refresh failed: " .. Validation.truncate(err, 160))
@@ -10345,6 +10549,18 @@ function UIController:destroy()
         return
     end
     self._destroyed = true
+    if self._inputConnection then
+        pcall(function()
+            self._inputConnection:Disconnect()
+        end)
+        self._inputConnection = nil
+    end
+    if self._controls then
+        pcall(function()
+            self._controls.screen:Destroy()
+        end)
+        self._controls = nil
+    end
     pcall(self._runtime.cancelTask, self._runtime, STATUS_TASK)
     -- Destroy the window through Rayfield's own lifecycle. Boot also calls
     -- library.Destroy as a final guard; Rayfield's Destroy is pcall-protected.
