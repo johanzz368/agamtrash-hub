@@ -7,6 +7,10 @@
 -- Server features require the agamtrash.hub server component to be
 -- installed in a place you own or are authorized to modify.
 --
+-- Dual-mode: the same file starts the server component when executed by
+-- a Script in ServerScriptService, and the Rayfield client when executed
+-- by an executor or a LocalScript in StarterPlayerScripts.
+--
 -- Rayfield is vendored/reviewed at commit a8ea17286b516dec19c2cc19fd0551eda4916d48
 -- (191447 bytes, SHA-256 08117b384347736b3c277680f8c5f98cb99a25d7a2bd8979f261f694e75f1831), Apache-2.0.
 -- See ATTRIBUTION.md and vendor/rayfield/NOTICE.md.
@@ -10493,15 +10497,1808 @@ end
 return UIController
 end
 
-local __bootOk, __bootError = pcall(function()
-    local Boot = __require("Client.Boot")
-    local started, success, detail = pcall(Boot.start)
-    if not started then
-        warn("[agamtrash.hub] Boot failed: " .. tostring(success))
-    elseif not success then
-        warn("[agamtrash.hub] Boot stopped: " .. tostring(detail))
+__modules["Server.ATMService"] = function()
+--!nonstrict
+-- ATM interaction test service. There is no real currency, no request to the
+-- game's economy, and no infinite-money behaviour. Every success is a bounded
+-- mock-ledger entry gated by distance, per-ATM cooldown, per-player credit cap
+-- and the request router's rate limit/idempotency. "validate" mode credits zero.
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CollectionService = game:GetService("CollectionService")
+
+local Protocol = __require("Shared.Protocol")
+
+local ATMService = {}
+ATMService.__index = ATMService
+
+function ATMService.new(options: table)
+    local self = setmetatable({}, ATMService)
+    self.config = options.config
+    self.ledger = options.ledger
+    self.logger = options.logger
+    self.lastUsedAt = {}
+    self.creditsByUser = {}
+    return self
+end
+
+local function characterRoot(player: Player): BasePart?
+    local character = player.Character
+    if not character then
+        return nil
     end
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    if humanoid and humanoid.Health <= 0 then
+        return nil
+    end
+    local root = character:FindFirstChild("HumanoidRootPart")
+    if root and root:IsA("BasePart") then
+        return root
+    end
+    return nil
+end
+
+local function findATM(id: string): Instance?
+    for _, instance in ipairs(CollectionService:GetTagged(Protocol.TAGS.ATM)) do
+        if instance:IsDescendantOf(workspace)
+            and instance:GetAttribute(Protocol.ATTRIBUTES.Fixture) == true
+            and instance:GetAttribute(Protocol.ATTRIBUTES.AtmId) == id
+        then
+            return instance
+        end
+    end
+    return nil
+end
+
+local function positionOf(instance: Instance): Vector3?
+    if instance:IsA("BasePart") then
+        return instance.Position
+    end
+    if instance:IsA("Model") then
+        local primary = instance.PrimaryPart
+        if primary then
+            return primary.Position
+        end
+        local part = instance:FindFirstChildWhichIsA("BasePart", true)
+        if part then
+            return part.Position
+        end
+    end
+    return nil
+end
+
+function ATMService:forgetPlayer(userId: number)
+    self.creditsByUser[userId] = nil
+end
+
+function ATMService:transact(player: Player, payload: table, _requestId: string): (string, table?)
+    local root = characterRoot(player)
+    if not root then
+        return "CHARACTER_UNAVAILABLE", nil
+    end
+
+    local atm = findATM(payload.atmId)
+    if not atm then
+        return "ATM_NOT_FOUND", nil
+    end
+
+    local position = positionOf(atm)
+    if not position then
+        return "ATM_NOT_FOUND", nil
+    end
+
+    local distance = (root.Position - position).Magnitude
+    if distance > self.config.Limits.ATMRange then
+        return "ATM_TOO_FAR", { distance = math.floor(distance), maximum = self.config.Limits.ATMRange }
+    end
+
+    local now = os.clock()
+    local cooldown = self.config.Limits.ATMCooldownSeconds
+    local lastUsed = self.lastUsedAt[atm]
+    if lastUsed and now - lastUsed < cooldown then
+        return "ATM_BUSY", {
+            retryAfter = math.ceil((cooldown - (now - lastUsed)) * 10) / 10,
+            cooldownSeconds = cooldown,
+        }
+    end
+
+    if payload.mode == "mock" and not self.config.Limits.ATMAllowMockCredits then
+        return "ATM_MODE_DISABLED", nil
+    end
+
+    self.lastUsedAt[atm] = now
+    local userId = player.UserId
+    local usedCredits = self.creditsByUser[userId] or 0
+    local currentBalance = self.ledger:get(userId)
+
+    if payload.mode == "validate" then
+        return "OK", {
+            mode = "validate",
+            credited = 0,
+            balance = currentBalance,
+            cooldownSeconds = cooldown,
+            remainingTestCredits = math.max(0, self.config.Limits.ATMTestCreditCap - usedCredits),
+            simulated = true,
+        }
+    end
+
+    if usedCredits >= self.config.Limits.ATMTestCreditCap then
+        return "TEST_CREDIT_CAP", {
+            mode = "mock",
+            credited = 0,
+            balance = currentBalance,
+            remainingTestCredits = 0,
+        }
+    end
+
+    local amount = self.config.Limits.ATMTestCredit
+    if usedCredits + amount > self.config.Limits.ATMTestCreditCap then
+        return "TEST_CREDIT_CAP", {
+            mode = "mock",
+            credited = 0,
+            balance = currentBalance,
+            remainingTestCredits = math.max(0, self.config.Limits.ATMTestCreditCap - usedCredits),
+        }
+    end
+    local ok, newBalance, ledgerError = self.ledger:credit(userId, amount, {
+        reason = "ATM test credit",
+        requestId = _requestId,
+    })
+    if not ok then
+        if ledgerError == "BALANCE_LIMIT" then
+            return "BALANCE_CAP", {
+                mode = "mock",
+                credited = 0,
+                balance = currentBalance,
+            }
+        end
+        return "INTERNAL_ERROR", nil
+    end
+
+    self.creditsByUser[userId] = usedCredits + amount
+    return "OK", {
+        mode = "mock",
+        credited = amount,
+        balance = newBalance,
+        cooldownSeconds = cooldown,
+        remainingTestCredits = math.max(0, self.config.Limits.ATMTestCreditCap - self.creditsByUser[userId]),
+        simulated = true,
+    }
+end
+
+return ATMService
+end
+
+__modules["Server.CombatService"] = function()
+--!nonstrict
+-- Combat Test Mode can only damage tagged, approved development dummies. There
+-- is no target-by-name input, no player target, and no client-supplied damage or
+-- position. The fixed damage value comes from server configuration.
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CollectionService = game:GetService("CollectionService")
+local Players = game:GetService("Players")
+
+local Protocol = __require("Shared.Protocol")
+
+local CombatService = {}
+CombatService.__index = CombatService
+
+function CombatService.new(options: table)
+    local self = setmetatable({}, CombatService)
+    self.config = options.config
+    self.logger = options.logger
+    self.respawning = {}
+    return self
+end
+
+local function characterRoot(player: Player): BasePart?
+    local character = player.Character
+    if not character then
+        return nil
+    end
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    if humanoid and humanoid.Health <= 0 then
+        return nil
+    end
+    local root = character:FindFirstChild("HumanoidRootPart")
+    if root and root:IsA("BasePart") then
+        return root
+    end
+    return nil
+end
+
+local function belongsToPlayer(instance: Instance): boolean
+    local current = instance
+    while current and current ~= workspace do
+        if current:IsA("Model") then
+            local player = Players:GetPlayerFromCharacter(current)
+            if player then
+                return true
+            end
+        end
+        current = current.Parent
+    end
+    return false
+end
+
+local function findTarget(id: string): Model?
+    for _, instance in ipairs(CollectionService:GetTagged(Protocol.TAGS.CombatTarget)) do
+        if instance:IsA("Model")
+            and instance:IsDescendantOf(workspace)
+            and instance:GetAttribute(Protocol.ATTRIBUTES.Fixture) == true
+            and instance:GetAttribute(Protocol.ATTRIBUTES.Id) == id
+            and instance:GetAttribute(Protocol.ATTRIBUTES.Approved) == true
+            and not belongsToPlayer(instance)
+        then
+            return instance
+        end
+    end
+    return nil
+end
+
+function CombatService:_scheduleRespawn(target: Model, humanoid: Humanoid)
+    local id = target:GetAttribute(Protocol.ATTRIBUTES.Id)
+    if type(id) ~= "string" then
+        return
+    end
+    self.respawning[id] = true
+    task.delay(self.config.Limits.CombatRespawnSeconds, function()
+        self.respawning[id] = nil
+        if target.Parent and humanoid.Parent then
+            pcall(function()
+                humanoid.Health = humanoid.MaxHealth
+            end)
+        end
+    end)
+end
+
+function CombatService:attack(player: Player, payload: table, _requestId: string): (string, table?)
+    local root = characterRoot(player)
+    if not root then
+        return "CHARACTER_UNAVAILABLE", nil
+    end
+
+    local target = findTarget(payload.targetId)
+    if not target then
+        return "TARGET_INVALID", nil
+    end
+    if belongsToPlayer(target) then
+        return "TARGET_PLAYER", nil
+    end
+
+    -- Refuse any target that has later become a player character or is not part
+    -- of our approved fixture namespace.
+    local humanoid = target:FindFirstChildOfClass("Humanoid")
+    if not humanoid then
+        return "TARGET_INVALID", nil
+    end
+    if self.respawning[payload.targetId] or humanoid.Health <= 0 then
+        return "TARGET_DEAD", nil
+    end
+
+    local targetPosition = target:GetPivot().Position
+    local distance = (root.Position - targetPosition).Magnitude
+    if distance > self.config.Limits.CombatRange then
+        return "TOO_FAR", { distance = math.floor(distance), maximum = self.config.Limits.CombatRange }
+    end
+
+    local damage = self.config.Limits.CombatDamage
+    local ok = pcall(function()
+        humanoid:TakeDamage(damage)
+    end)
+    if not ok then
+        return "INTERNAL_ERROR", nil
+    end
+
+    if humanoid.Health <= 0 then
+        self:_scheduleRespawn(target, humanoid)
+    end
+
+    return "OK", {
+        targetId = payload.targetId,
+        targetName = target:GetAttribute(Protocol.ATTRIBUTES.DisplayName) or target.Name,
+        damage = damage,
+        health = math.max(0, math.floor(humanoid.Health)),
+        maxHealth = math.floor(humanoid.MaxHealth),
+        defeated = humanoid.Health <= 0,
+        distance = math.floor(distance),
+    }
+end
+
+return CombatService
+end
+
+__modules["Server.DevFixtures"] = function()
+--!nonstrict
+-- Development fixtures for an authorized experience. These are ordinary
+-- Roblox instances created and owned by the server. They do not depend on any
+-- third-party game's objects, tags, remotes or economy.
+--
+-- The folder is only created after place-level authorization. Per-player
+-- authorization is still checked by the request router on every action.
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CollectionService = game:GetService("CollectionService")
+
+local Protocol = __require("Shared.Protocol")
+local Validation = __require("Shared.Validation")
+
+local DevFixtures = {}
+DevFixtures.__index = DevFixtures
+
+function DevFixtures.new(options: table)
+    local self = setmetatable({}, DevFixtures)
+    self.config = options.config
+    self.logger = options.logger
+    self.folder = nil
+    self.counts = { Money = 0, ATM = 0, CombatTarget = 0, Item = 0 }
+    return self
+end
+
+local function makePart(parent: Instance, name: string, size: Vector3, cframe: CFrame, color: Color3, material: Enum.Material?): Part
+    local part = Instance.new("Part")
+    part.Name = name
+    part.Size = size
+    part.CFrame = cframe
+    part.Anchored = true
+    part.Color = color
+    part.Material = material or Enum.Material.SmoothPlastic
+    part.TopSurface = Enum.SurfaceType.Smooth
+    part.BottomSurface = Enum.SurfaceType.Smooth
+    part.Parent = parent
+    return part
+end
+
+function DevFixtures:_label(parent: Part, title: string, subtitle: string)
+    local surface = Instance.new("SurfaceGui")
+    surface.Name = "TestLabel"
+    surface.Face = Enum.NormalId.Front
+    surface.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
+    surface.PixelsPerStud = 42
+    surface.LightInfluence = 0
+
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.fromScale(1, 1)
+    frame.BackgroundColor3 = Color3.fromRGB(12, 18, 26)
+    frame.BorderSizePixel = 0
+    frame.Parent = surface
+
+    local heading = Instance.new("TextLabel")
+    heading.Size = UDim2.new(1, -8, 0.55, 0)
+    heading.Position = UDim2.fromOffset(4, 2)
+    heading.BackgroundTransparency = 1
+    heading.Font = Enum.Font.GothamBold
+    heading.TextColor3 = Color3.fromRGB(110, 190, 255)
+    heading.TextScaled = true
+    heading.Text = title
+    heading.Parent = frame
+
+    local detail = Instance.new("TextLabel")
+    detail.Size = UDim2.new(1, -8, 0.4, 0)
+    detail.Position = UDim2.fromScale(0, 0.58)
+    detail.BackgroundTransparency = 1
+    detail.Font = Enum.Font.Gotham
+    detail.TextColor3 = Color3.fromRGB(220, 230, 240)
+    detail.TextScaled = true
+    detail.Text = subtitle
+    detail.Parent = frame
+
+    surface.Parent = parent
+end
+
+function DevFixtures:_createPlatform(folder: Folder, origin: Vector3)
+    local platform = makePart(
+        folder,
+        "TestPlatform",
+        Vector3.new(76, 2, 60),
+        CFrame.new(origin.X, origin.Y, origin.Z),
+        Color3.fromRGB(29, 36, 46),
+        Enum.Material.Slate
+    )
+    platform.CanCollide = true
+    platform:SetAttribute(Protocol.ATTRIBUTES.Fixture, true)
+
+    local trim = makePart(
+        folder,
+        "PlatformTrim",
+        Vector3.new(76, 0.25, 0.5),
+        CFrame.new(origin.X, origin.Y + 1.05, origin.Z + 30),
+        Color3.fromRGB(30, 112, 200),
+        Enum.Material.Neon
+    )
+    trim.CanCollide = false
+
+    local sign = makePart(
+        folder,
+        "SandboxSign",
+        Vector3.new(20, 5, 0.5),
+        CFrame.new(origin.X, origin.Y + 5, origin.Z - 29.5),
+        Color3.fromRGB(18, 23, 30),
+        Enum.Material.SmoothPlastic
+    )
+    sign.CanCollide = false
+    self:_label(sign, "AGAMTRASH · DEV SANDBOX", "Server-authorized test fixtures only")
+    return origin.Y + 1.25
+end
+
+function DevFixtures:_createMoney(folder: Folder, origin: Vector3, topY: number)
+    local count = math.clamp(math.floor(self.config.Fixtures.MoneyCount), 0, 50)
+    local values = { 5, 10, 15, 25, 40, 50, 75, 100 }
+    for index = 1, count do
+        local row = math.floor((index - 1) / 5)
+        local column = (index - 1) % 5
+        local coin = makePart(
+            folder,
+            "TestMoney_" .. tostring(index),
+            Vector3.new(1.5, 1.5, 0.24),
+            CFrame.new(origin.X - 20 + column * 10, topY + 3.2 + row * 0.05, origin.Z + 10 - row * 6)
+                * CFrame.Angles(0, 0, math.rad(90)),
+            Color3.fromRGB(255, 199, 54),
+            Enum.Material.Neon
+        )
+        coin.Shape = Enum.PartType.Cylinder
+        coin.CanCollide = false
+        coin.CanTouch = false
+        coin:SetAttribute(Protocol.ATTRIBUTES.Id, string.format("money_%04d", index))
+        coin:SetAttribute(Protocol.ATTRIBUTES.Value, values[(index - 1) % #values + 1])
+        coin:SetAttribute(Protocol.ATTRIBUTES.DisplayName, "Test Cash")
+        coin:SetAttribute(Protocol.ATTRIBUTES.Category, "Cash")
+        coin:SetAttribute(Protocol.ATTRIBUTES.Available, true)
+        coin:SetAttribute(Protocol.ATTRIBUTES.Fixture, true)
+        CollectionService:AddTag(coin, Protocol.TAGS.Money)
+    end
+    self.counts.Money = count
+end
+
+function DevFixtures:_createATM(folder: Folder, origin: Vector3, topY: number, index: number, offsetX: number)
+    local model = Instance.new("Model")
+    model.Name = "TestATM_" .. tostring(index)
+    model:SetAttribute(Protocol.ATTRIBUTES.AtmId, string.format("atm_%04d", index))
+    model:SetAttribute(Protocol.ATTRIBUTES.DisplayName, "Test ATM " .. tostring(index))
+    model:SetAttribute(Protocol.ATTRIBUTES.Fixture, true)
+
+    local body = makePart(
+        model,
+        "Body",
+        Vector3.new(4, 7, 1.5),
+        CFrame.new(origin.X + offsetX, topY + 3.5, origin.Z - 20),
+        Color3.fromRGB(38, 47, 59),
+        Enum.Material.Metal
+    )
+    body.CanCollide = true
+
+    local screen = makePart(
+        model,
+        "Screen",
+        Vector3.new(3, 2.2, 0.15),
+        CFrame.new(origin.X + offsetX, topY + 5, origin.Z - 19.2),
+        Color3.fromRGB(18, 66, 112),
+        Enum.Material.Neon
+    )
+    screen.CanCollide = false
+    self:_label(screen, "TEST ATM", "No real currency")
+    model.PrimaryPart = body
+    model.Parent = folder
+    CollectionService:AddTag(model, Protocol.TAGS.ATM)
+    self.counts.ATM += 1
+end
+
+function DevFixtures:_createDummy(folder: Folder, origin: Vector3, topY: number, index: number, offsetX: number, offsetZ: number)
+    local model = Instance.new("Model")
+    model.Name = "TrainingDummy_" .. tostring(index)
+    model:SetAttribute(Protocol.ATTRIBUTES.Id, string.format("dummy_%04d", index))
+    model:SetAttribute(Protocol.ATTRIBUTES.DisplayName, "Training Dummy " .. tostring(index))
+    model:SetAttribute(Protocol.ATTRIBUTES.Approved, true)
+    model:SetAttribute(Protocol.ATTRIBUTES.Category, "Combat Test Target")
+    model:SetAttribute(Protocol.ATTRIBUTES.Fixture, true)
+
+    local root = makePart(
+        model,
+        "HumanoidRootPart",
+        Vector3.new(2, 2, 1),
+        CFrame.new(origin.X + offsetX, topY + 3, origin.Z + offsetZ),
+        Color3.fromRGB(96, 40, 45),
+        Enum.Material.SmoothPlastic
+    )
+    root.Transparency = 1
+    root.CanCollide = false
+
+    local torso = makePart(
+        model,
+        "Torso",
+        Vector3.new(2.5, 3, 1.25),
+        CFrame.new(origin.X + offsetX, topY + 3.3, origin.Z + offsetZ),
+        Color3.fromRGB(220, 92, 78),
+        Enum.Material.SmoothPlastic
+    )
+    torso.CanCollide = true
+
+    local head = makePart(
+        model,
+        "Head",
+        Vector3.new(1.8, 1.8, 1.8),
+        CFrame.new(origin.X + offsetX, topY + 5.7, origin.Z + offsetZ),
+        Color3.fromRGB(240, 210, 180),
+        Enum.Material.SmoothPlastic
+    )
+    head.CanCollide = true
+    head:SetAttribute(Protocol.ATTRIBUTES.DisplayName, "Training Dummy " .. tostring(index))
+
+    local humanoid = Instance.new("Humanoid")
+    humanoid.MaxHealth = 100
+    humanoid.Health = 100
+    humanoid.DisplayName = "Training Dummy " .. tostring(index)
+    humanoid.Parent = model
+
+    model.PrimaryPart = root
+    model.Parent = folder
+    CollectionService:AddTag(model, Protocol.TAGS.CombatTarget)
+    self.counts.CombatTarget += 1
+end
+
+function DevFixtures:_createItems(folder: Folder, origin: Vector3, topY: number)
+    local count = math.clamp(math.floor(self.config.Fixtures.ItemCount), 0, 50)
+    local catalog = {
+        { Name = "Test Medkit", Category = "Test Consumable", Color = Color3.fromRGB(73, 209, 126) },
+        { Name = "Test Crate Key", Category = "Test Tool", Color = Color3.fromRGB(90, 164, 255) },
+        { Name = "Test Bread", Category = "Test Consumable", Color = Color3.fromRGB(230, 173, 91) },
+        { Name = "Test Scrap", Category = "Test Material", Color = Color3.fromRGB(166, 176, 189) },
+    }
+    for index = 1, count do
+        local meta = catalog[(index - 1) % #catalog + 1]
+        local row = math.floor((index - 1) / 4)
+        local column = (index - 1) % 4
+        local item = makePart(
+            folder,
+            "TestItem_" .. tostring(index),
+            Vector3.new(1.4, 1.4, 1.4),
+            CFrame.new(origin.X + 22 - column * 4, topY + 2.4 + row * 2.4, origin.Z + 18),
+            meta.Color,
+            Enum.Material.Neon
+        )
+        item.Rotation = Vector3.new(0, 25 * index, 0)
+        item.CanCollide = false
+        item.CanTouch = false
+        item:SetAttribute(Protocol.ATTRIBUTES.Id, string.format("item_%04d", index))
+        item:SetAttribute(Protocol.ATTRIBUTES.DisplayName, meta.Name)
+        item:SetAttribute(Protocol.ATTRIBUTES.Category, meta.Category)
+        item:SetAttribute(Protocol.ATTRIBUTES.Fixture, true)
+        CollectionService:AddTag(item, Protocol.TAGS.Item)
+    end
+    self.counts.Item = count
+end
+
+function DevFixtures:create(): boolean
+    if not self.config.Fixtures.Enabled then
+        self.logger:warn("Development fixtures are disabled in ServerConfig.")
+        return false
+    end
+
+    local existing = workspace:FindFirstChild(self.config.Fixtures.FolderName)
+    if existing then
+        if existing:GetAttribute(Protocol.ATTRIBUTES.Fixture) == true then
+            existing:Destroy()
+        else
+            self.logger:error("A workspace object named '" .. self.config.Fixtures.FolderName .. "' already exists and is not managed by Agamtrash. Fixtures were not created.")
+            return false
+        end
+    end
+
+    local origin = Vector3.new(
+        self.config.Fixtures.OriginX,
+        self.config.Fixtures.OriginY,
+        self.config.Fixtures.OriginZ
+    )
+    local folder = Instance.new("Folder")
+    folder.Name = self.config.Fixtures.FolderName
+    folder:SetAttribute(Protocol.ATTRIBUTES.Fixture, true)
+    folder:SetAttribute(Protocol.ATTRIBUTES.ProtocolVersion, Protocol.PROTOCOL)
+    folder.Parent = workspace
+    self.folder = folder
+
+    local topY = self:_createPlatform(folder, origin)
+    self:_createMoney(folder, origin, topY)
+
+    local atmCount = math.clamp(math.floor(self.config.Fixtures.ATMCount), 0, 50)
+    for index = 1, atmCount do
+        self:_createATM(folder, origin, topY, index, -10 + (index - 1) * 8)
+    end
+
+    local dummyCount = math.clamp(math.floor(self.config.Fixtures.DummyCount), 0, 50)
+    for index = 1, dummyCount do
+        local column = (index - 1) % 3
+        local row = math.floor((index - 1) / 3)
+        self:_createDummy(folder, origin, topY, index, -8 + column * 8, -6 - row * 6)
+    end
+
+    self:_createItems(folder, origin, topY)
+
+    self.logger:info(string.format(
+        "Development fixtures ready: %d money, %d ATM, %d target, %d item.",
+        self.counts.Money,
+        self.counts.ATM,
+        self.counts.CombatTarget,
+        self.counts.Item
+    ))
+    return true
+end
+
+function DevFixtures:isReady(): boolean
+    return self.folder ~= nil and self.folder.Parent ~= nil
+end
+
+function DevFixtures:getSummary(): table
+    return {
+        ready = self:isReady(),
+        money = self.counts.Money,
+        atms = self.counts.ATM,
+        targets = self.counts.CombatTarget,
+        items = self.counts.Item,
+    }
+end
+
+return DevFixtures
+end
+
+__modules["Server.MoneyService"] = function()
+--!nonstrict
+-- Server-authoritative collection of tagged development fixtures. The client
+-- only sends an ID. Value, distance, availability, respawn and credit decisions
+-- are resolved here from server-owned attributes.
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CollectionService = game:GetService("CollectionService")
+local Players = game:GetService("Players")
+
+local Protocol = __require("Shared.Protocol")
+local Validation = __require("Shared.Validation")
+
+local MoneyService = {}
+MoneyService.__index = MoneyService
+
+function MoneyService.new(options: table)
+    local self = setmetatable({}, MoneyService)
+    self.config = options.config
+    self.ledger = options.ledger
+    self.logger = options.logger
+    self.respawnTokens = {}
+    return self
+end
+
+local function characterRoot(player: Player): BasePart?
+    local character = player.Character
+    if not character then
+        return nil
+    end
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    if humanoid and humanoid.Health <= 0 then
+        return nil
+    end
+    local root = character:FindFirstChild("HumanoidRootPart")
+    if root and root:IsA("BasePart") then
+        return root
+    end
+    return nil
+end
+
+local function findCollectible(id: string): BasePart?
+    for _, instance in ipairs(CollectionService:GetTagged(Protocol.TAGS.Money)) do
+        if instance:IsA("BasePart")
+            and instance:IsDescendantOf(workspace)
+            and instance:GetAttribute(Protocol.ATTRIBUTES.Fixture) == true
+            and instance:GetAttribute(Protocol.ATTRIBUTES.Id) == id
+        then
+            return instance
+        end
+    end
+    return nil
+end
+
+function MoneyService:_setAvailable(part: BasePart, available: boolean)
+    part:SetAttribute(Protocol.ATTRIBUTES.Available, available)
+    if available then
+        part.Transparency = self._originalTransparency[part] or 0
+        part.CanCollide = false
+        part.CanTouch = self._originalCanTouch[part] ~= false
+    else
+        self._originalTransparency[part] = part.Transparency
+        self._originalCanTouch[part] = part.CanTouch
+        part.Transparency = 1
+        part.CanCollide = false
+        part.CanTouch = false
+    end
+end
+
+function MoneyService:_scheduleRespawn(part: BasePart)
+    local token = {}
+    self.respawnTokens[part] = token
+    local delay = self.config.Limits.MoneyRespawnSeconds
+    task.delay(delay, function()
+        if self.respawnTokens[part] ~= token then
+            return
+        end
+        self.respawnTokens[part] = nil
+        if not part.Parent then
+            return
+        end
+        self:_setAvailable(part, true)
+        self._originalTransparency[part] = nil
+        self._originalCanTouch[part] = nil
+    end)
+end
+
+function MoneyService:collect(player: Player, payload: table, _requestId: string): (string, table?)
+    if not self._originalTransparency then
+        self._originalTransparency = {}
+        self._originalCanTouch = {}
+    end
+
+    local part = findCollectible(payload.collectibleId)
+    if not part then
+        return "COLLECTIBLE_GONE", nil
+    end
+    if part:GetAttribute(Protocol.ATTRIBUTES.Available) ~= true then
+        return "COLLECTIBLE_GONE", nil
+    end
+
+    local root = characterRoot(player)
+    if not root then
+        return "CHARACTER_UNAVAILABLE", nil
+    end
+
+    local value = tonumber(part:GetAttribute(Protocol.ATTRIBUTES.Value))
+    if not Validation.isFiniteNumber(value)
+        or value < self.config.Limits.MoneyValueMin
+        or value > self.config.Limits.MoneyValueMax
+    then
+        return "COLLECTIBLE_INVALID", nil
+    end
+
+    local distance = (root.Position - part.Position).Magnitude
+    if distance > self.config.Limits.MoneyMaxDistance then
+        return "TOO_FAR", { distance = math.floor(distance) }
+    end
+
+    -- Mark atomically before any work that can yield. A second request cannot
+    -- collect the same fixture while the ledger credit is pending.
+    self:_setAvailable(part, false)
+
+    local ok, balance, ledgerError = self.ledger:credit(player.UserId, value, {
+        reason = "test pickup",
+        requestId = _requestId,
+    })
+    if not ok then
+        self:_setAvailable(part, true)
+        if ledgerError == "BALANCE_LIMIT" then
+            return "BALANCE_CAP", { balance = balance }
+        end
+        return "INTERNAL_ERROR", nil
+    end
+
+    self:_scheduleRespawn(part)
+
+    local displayName = Validation.cleanText(part:GetAttribute(Protocol.ATTRIBUTES.DisplayName), 80) or part.Name
+    return "OK", {
+        itemId = payload.collectibleId,
+        itemName = displayName,
+        value = math.floor(value),
+        balance = balance,
+        respawnIn = self.config.Limits.MoneyRespawnSeconds,
+        distance = math.floor(distance),
+    }
+end
+
+return MoneyService
+end
+
+__modules["Server.NoclipService"] = function()
+--!nonstrict
+-- Server-authoritative noclip debug sessions.
+--
+-- The client never changes collision. On enable, the server records each
+-- character part's original CanCollide and CollisionGroup, then disables those
+-- collisions in a dedicated collision group and restores the exact properties
+-- on disable, death, character removal, player removal or timeout.
+--
+-- Roblox physics is client-simulated for a player's own character. The server
+-- owns the state and property changes, but this project cannot guarantee that
+-- every executor/network-ownership combination applies them identically. That
+-- limitation is documented and is not presented as verified live.
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local PhysicsService = game:GetService("PhysicsService")
+local Players = game:GetService("Players")
+
+local Protocol = __require("Shared.Protocol")
+
+local COLLISION_GROUP = "AgamtrashNoclip"
+
+local NoclipService = {}
+NoclipService.__index = NoclipService
+
+function NoclipService.new(options: table)
+    local self = setmetatable({}, NoclipService)
+    self.config = options.config
+    self.logger = options.logger
+    self.states = {}
+    self.groupAvailable = false
+
+    pcall(function()
+        PhysicsService:RegisterCollisionGroup(COLLISION_GROUP)
+    end)
+    local groupOk = pcall(function()
+        PhysicsService:CollisionGroupSetCollidable(COLLISION_GROUP, "Default", false)
+    end)
+    self.groupAvailable = groupOk
+    if not groupOk then
+        self.logger:warn("PhysicsService collision group is unavailable; noclip will use CanCollide only.")
+    end
+
+    local cleanup = Players.PlayerRemoving:Connect(function(player)
+        self:_restore(player, "player leaving")
+    end)
+    self._playerRemovingConnection = cleanup
+    return self
+end
+
+local function characterRoot(character: Model?): BasePart?
+    if not character then
+        return nil
+    end
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    if humanoid and humanoid.Health <= 0 then
+        return nil
+    end
+    local root = character:FindFirstChild("HumanoidRootPart")
+    if root and root:IsA("BasePart") then
+        return root
+    end
+    return nil
+end
+
+function NoclipService:getStatus(player: Player): table
+    local state = self.states[player.UserId]
+    if not state then
+        return { active = false }
+    end
+    if state.character ~= player.Character then
+        self:_restore(player, "character changed")
+        return { active = false }
+    end
+    return {
+        active = true,
+        parts = state.partCount,
+        expiresIn = math.max(0, state.expiresAt - os.clock()),
+        collisionGroup = self.groupAvailable,
+    }
+end
+
+function NoclipService:_restore(player: Player, reason: string): (number, number)
+    local state = self.states[player.UserId]
+    if not state then
+        return 0, 0
+    end
+    -- Remove first so a property callback or disconnect cannot re-enter.
+    self.states[player.UserId] = nil
+    if state.diedConnection then
+        pcall(function()
+            state.diedConnection:Disconnect()
+        end)
+    end
+    if state.removingConnection then
+        pcall(function()
+            state.removingConnection:Disconnect()
+        end)
+    end
+
+    local restored = 0
+    local failed = 0
+    for _, entry in ipairs(state.parts) do
+        local part = entry.part
+        if part and part.Parent then
+            local ok = pcall(function()
+                part.CanCollide = entry.canCollide
+                if self.groupAvailable then
+                    part.CollisionGroup = entry.collisionGroup
+                end
+            end)
+            if ok then
+                restored += 1
+            else
+                failed += 1
+            end
+        end
+    end
+    if self.logger then
+        if failed > 0 then
+            self.logger:error(string.format("Noclip restore ended with %d failed part(s) after %s.", failed, reason))
+        else
+            self.logger:info(string.format("Noclip restored %d part(s) after %s.", restored, reason))
+        end
+    end
+    return restored, failed
+end
+
+function NoclipService:enable(player: Player): (string, table?)
+    local character = player.Character
+    local root = characterRoot(character)
+    if not character or not root then
+        return "CHARACTER_UNAVAILABLE", nil
+    end
+
+    local existing = self.states[player.UserId]
+    if existing and existing.character == character then
+        return "OK", self:getStatus(player)
+    end
+    if existing then
+        self:_restore(player, "new character")
+    end
+
+    local parts = {}
+    for _, descendant in ipairs(character:GetDescendants()) do
+        if descendant:IsA("BasePart") then
+            table.insert(parts, {
+                part = descendant,
+                canCollide = descendant.CanCollide,
+                collisionGroup = descendant.CollisionGroup,
+            })
+        end
+    end
+    if #parts == 0 then
+        return "NOCLIP_UNAVAILABLE", nil
+    end
+
+    local failed = 0
+    for _, entry in ipairs(parts) do
+        local ok = pcall(function()
+            entry.part.CanCollide = false
+            if self.groupAvailable then
+                entry.part.CollisionGroup = COLLISION_GROUP
+            end
+        end)
+        if not ok then
+            failed += 1
+        end
+    end
+    if failed > 0 then
+        -- Roll back any properties that were changed.
+        for _, entry in ipairs(parts) do
+            pcall(function()
+                entry.part.CanCollide = entry.canCollide
+                if self.groupAvailable then
+                    entry.part.CollisionGroup = entry.collisionGroup
+                end
+            end)
+        end
+        return "NOCLIP_UNAVAILABLE", { failedParts = failed }
+    end
+
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    local token = {}
+    local state = {
+        character = character,
+        parts = parts,
+        partCount = #parts,
+        token = token,
+        expiresAt = os.clock() + self.config.Limits.NoclipMaxDuration,
+    }
+
+    if humanoid then
+        state.diedConnection = humanoid.Died:Connect(function()
+            self:_restore(player, "humanoid died")
+        end)
+    end
+    state.removingConnection = player.CharacterRemoving:Connect(function()
+        self:_restore(player, "character removing")
+    end)
+    self.states[player.UserId] = state
+
+    task.delay(self.config.Limits.NoclipMaxDuration, function()
+        local current = self.states[player.UserId]
+        if current and current.token == token then
+            self:_restore(player, "timeout")
+        end
+    end)
+
+    if self.logger then
+        self.logger:info("Noclip debug enabled for an authorized session.")
+    end
+    return "OK", {
+        active = true,
+        parts = #parts,
+        expiresIn = self.config.Limits.NoclipMaxDuration,
+        collisionGroup = self.groupAvailable,
+    }
+end
+
+function NoclipService:disable(player: Player): (string, table?)
+    if not self.states[player.UserId] then
+        return "OK", { active = false, restored = 0, failed = 0 }
+    end
+    local restored, failed = self:_restore(player, "requested")
+    if failed > 0 then
+        return "NOCLIP_RESTORE_FAILED", { active = false, restored = restored, failed = failed }
+    end
+    return "OK", { active = false, restored = restored, failed = 0 }
+end
+
+function NoclipService:status(player: Player): (string, table?)
+    return "OK", self:getStatus(player)
+end
+
+return NoclipService
+end
+
+__modules["Server.RequestRouter"] = function()
+--!nonstrict
+-- Transport boundary shared by all server feature remotes. It validates the
+-- envelope, applies authorization/rate limiting/idempotency, invokes only our
+-- registered handler and returns plain data. No raw exceptions are sent.
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Payloads = __require("Shared.Payloads")
+local Protocol = __require("Shared.Protocol")
+local Validation = __require("Shared.Validation")
+
+local RequestRouter = {}
+RequestRouter.__index = RequestRouter
+
+local MAX_DEPTH = 4
+local MAX_ENTRIES = 80
+
+local function sanitize(value: any, depth: number, seen: { [any]: boolean }?): any
+    local valueType = type(value)
+    if valueType == "string" then
+        return Validation.truncate(value, 300)
+    end
+    if valueType == "number" then
+        if value == value and value ~= math.huge and value ~= -math.huge then
+            return value
+        end
+        return nil
+    end
+    if valueType == "boolean" or valueType == "nil" then
+        return value
+    end
+    if valueType ~= "table" or depth >= MAX_DEPTH then
+        return nil
+    end
+    local checked = seen or {}
+    if checked[value] then
+        return nil
+    end
+    checked[value] = true
+
+    local result = {}
+    local count = 0
+    for key, child in pairs(value) do
+        if count >= MAX_ENTRIES then
+            break
+        end
+        local safeKey = nil
+        if type(key) == "string" and #key <= 40 then
+            safeKey = key
+        elseif type(key) == "number" and key == key and key % 1 == 0 then
+            safeKey = key
+        end
+        if safeKey ~= nil then
+            local safeChild = sanitize(child, depth + 1, checked)
+            if safeChild ~= nil then
+                result[safeKey] = safeChild
+                count += 1
+            end
+        end
+    end
+    checked[value] = nil
+    return result
+end
+
+function RequestRouter.new(options: table)
+    local self = setmetatable({}, RequestRouter)
+    self.security = options.security
+    self.logger = options.logger
+    self.responseRemote = options.responseRemote
+    self.handlers = {}
+    self.remotes = {}
+    return self
+end
+
+function RequestRouter:register(feature: string, remoteName: string, parser: (any) -> (boolean, table?, string?), handler: (Player, table, string) -> (string, table?)): boolean
+    if self.handlers[feature] then
+        return false
+    end
+    self.handlers[feature] = {
+        feature = feature,
+        parser = parser,
+        handler = handler,
+    }
+    self.remotes[feature] = remoteName
+    return true
+end
+
+function RequestRouter:_respond(player: Player, response: table)
+    if not player or not player.Parent then
+        return
+    end
+    local ok = pcall(function()
+        self.responseRemote:FireClient(player, response)
+    end)
+    if not ok and self.logger then
+        self.logger:warn("Could not deliver a " .. tostring(response.feature) .. " response to a client.")
+    end
+end
+
+function RequestRouter:handle(player: Player, feature: string, rawEnvelope: any)
+    local paramsOk, envelope = Payloads.envelope(rawEnvelope)
+    local requestId = paramsOk and envelope.requestId or nil
+    if not paramsOk then
+        self:_respond(player, self.security:rejection(feature, "INVALID_PAYLOAD", nil))
+        return
+    end
+
+    local handlerInfo = self.handlers[feature]
+    if not handlerInfo then
+        self:_respond(player, self.security:rejection(feature, "SERVICE_UNAVAILABLE", requestId))
+        return
+    end
+
+    local context, rejection = self.security:beginRequest(player, feature, requestId)
+    if rejection then
+        self:_respond(player, rejection)
+        return
+    end
+    if context and context.cached then
+        self:_respond(player, context.cached)
+        return
+    end
+
+    local payloadOk, payload = handlerInfo.parser(envelope.payload)
+    if not payloadOk then
+        local response = self.security:rejection(feature, "INVALID_PAYLOAD", requestId)
+        self:_respond(player, response)
+        return
+    end
+
+    local success, code, data = pcall(handlerInfo.handler, player, payload, requestId)
+    if not success then
+        if self.logger then
+            self.logger:error("Feature handler " .. feature .. " failed: " .. Validation.truncate(code, 180))
+        end
+        code = "INTERNAL_ERROR"
+        data = nil
+    end
+    if type(code) ~= "string" then
+        code = "INTERNAL_ERROR"
+    end
+    if Protocol.MESSAGES[code] == nil then
+        if self.logger then
+            self.logger:warn("Feature handler " .. feature .. " returned an undocumented code; using INTERNAL_ERROR.")
+        end
+        code = "INTERNAL_ERROR"
+        data = nil
+    end
+
+    local response = {
+        ok = code == "OK",
+        feature = feature,
+        requestId = requestId,
+        code = code,
+        message = Protocol.message(code),
+        data = sanitize(data or {}, 0),
+        at = os.clock(),
+    }
+    self.security:completeRequest(player, feature, context, response)
+    self:_respond(player, response)
+end
+
+function RequestRouter:connect(remote: RemoteEvent, feature: string)
+    local connection = remote.OnServerEvent:Connect(function(player, rawEnvelope)
+        self:handle(player, feature, rawEnvelope)
+    end)
+    return connection
+end
+
+return RequestRouter
+end
+
+__modules["Server.SecurityManager"] = function()
+--!nonstrict
+-- Server-side authorization, rate-limit and idempotency policy. This module is
+-- intentionally all-or-nothing: if the place, tester or feature check fails,
+-- the caller gets a structured rejection and no service code runs.
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local AuthorizationPolicy = __require("Shared.AuthorizationPolicy")
+local Protocol = __require("Shared.Protocol")
+local DedupeCache = __require("Shared.DedupeCache")
+local RateLimiter = __require("Shared.RateLimiter")
+local Validation = __require("Shared.Validation")
+
+local SecurityManager = {}
+SecurityManager.__index = SecurityManager
+
+local DEFAULT_RATES = {
+    Money = { burst = 8, refill = 4 },
+    ATM = { burst = 3, refill = 1.5 },
+    Combat = { burst = 8, refill = 4 },
+    Noclip = { burst = 3, refill = 1 },
+    Environment = { burst = 4, refill = 1 },
+}
+
+function SecurityManager.new(config: table, logger: any, runService: any)
+    local self = setmetatable({}, SecurityManager)
+    self.config = config
+    self.logger = logger
+    self.runService = runService
+    self.isStudio = false
+    pcall(function()
+        self.isStudio = self.runService:IsStudio()
+    end)
+    self.limiters = {}
+    self.caches = {}
+    self.environmentLimiters = {}
+
+    local idempotency = config.Idempotency or {}
+    local ttl = tonumber(idempotency.ttlSeconds) or 60
+    local maxEntries = tonumber(idempotency.maxEntries) or 500
+    for _, feature in ipairs({ "Money", "ATM", "Combat", "Noclip" }) do
+        self.caches[feature] = DedupeCache.new(math.max(1, ttl), math.max(10, maxEntries))
+    end
+    return self
+end
+
+function SecurityManager:authorize(player: Player): table
+    if not player then
+        return { authorized = false, code = "NOT_AUTHORIZED", scope = "none" }
+    end
+
+    return AuthorizationPolicy.evaluate({
+        placeId = game.PlaceId,
+        userId = player.UserId,
+        isStudio = self.isStudio,
+        allowStudio = self.config.AllowStudio == true,
+        authorizedPlaceIds = self.config.AuthorizedPlaceIds,
+        authorizedUserIds = self.config.TesterUserIds,
+    })
+end
+
+function SecurityManager:isPlaceAuthorized(): boolean
+    return AuthorizationPolicy.isPlaceAuthorized(
+        game.PlaceId,
+        self.isStudio,
+        self.config.AllowStudio == true,
+        self.config.AuthorizedPlaceIds
+    )
+end
+
+function SecurityManager:isFeatureEnabled(feature: string): boolean
+    return self.config.Features ~= nil and self.config.Features[feature] == true
+end
+
+function SecurityManager:_getLimiter(bucket: string, player: Player, feature: string)
+    local key = tostring(player.UserId)
+    local userLimiters = self.limiters[key]
+    if not userLimiters then
+        userLimiters = {}
+        self.limiters[key] = userLimiters
+    end
+    if not userLimiters[feature] then
+        local rates = (self.config.RateLimits and self.config.RateLimits[feature]) or DEFAULT_RATES[feature] or DEFAULT_RATES.Money
+        local burst = math.max(1, tonumber(rates.burst) or 4)
+        local refill = math.max(0.1, tonumber(rates.refill) or 1)
+        userLimiters[feature] = RateLimiter.new(burst, refill)
+    end
+    return userLimiters[feature]
+end
+
+function SecurityManager:consumeEnvironment(player: Player): (boolean, number)
+    if not player then
+        return false, 0
+    end
+    local key = tostring(player.UserId)
+    if not self.environmentLimiters[key] then
+        local rates = (self.config.RateLimits and self.config.RateLimits.Environment) or DEFAULT_RATES.Environment
+        self.environmentLimiters[key] = RateLimiter.new(math.max(1, tonumber(rates.burst) or 4), math.max(0.1, tonumber(rates.refill) or 1))
+    end
+    local limiter = self.environmentLimiters[key]
+    local now = os.clock()
+    local allowed = limiter:tryConsume(now, 1)
+    return allowed, limiter:getRetryAfter(now, 1)
+end
+
+function SecurityManager:beginRequest(player: Player, feature: string, requestId: string): (table?, table?)
+    local decision = self:authorize(player)
+    if not decision.authorized then
+        return nil, {
+            ok = false,
+            feature = feature,
+            requestId = requestId,
+            code = decision.code,
+            message = Protocol.message(decision.code),
+            scope = decision.scope,
+        }
+    end
+
+    if not self:isFeatureEnabled(feature) then
+        return nil, {
+            ok = false,
+            feature = feature,
+            requestId = requestId,
+            code = "FEATURE_DISABLED",
+            message = Protocol.message("FEATURE_DISABLED"),
+        }
+    end
+
+    local cache = self.caches[feature]
+    local cacheKey = tostring(player.UserId) .. ":" .. requestId
+    if cache then
+        local hit, cached = cache:get(cacheKey, os.clock())
+        if hit then
+            if type(cached) == "table" then
+                return { cached = cached }, nil
+            end
+        end
+    end
+
+    local limiter = self:_getLimiter(tostring(player.UserId), player, feature)
+    local now = os.clock()
+    if not limiter:tryConsume(now, 1) then
+        local retryAfter = limiter:getRetryAfter(now, 1)
+        return nil, {
+            ok = false,
+            feature = feature,
+            requestId = requestId,
+            code = "RATE_LIMITED",
+            message = Protocol.message("RATE_LIMITED"),
+            retryAfter = math.ceil(retryAfter * 10) / 10,
+        }
+    end
+
+    return { userId = player.UserId, cacheKey = cacheKey }, nil
+end
+
+function SecurityManager:completeRequest(player: Player, feature: string, context: table?, response: table)
+    if not context or not context.cacheKey then
+        return
+    end
+    local cache = self.caches[feature]
+    if cache then
+        cache:put(context.cacheKey, response, os.clock())
+    end
+end
+
+function SecurityManager:rejection(feature: string, code: string, requestId: string?): table
+    local safeCode = Validation.cleanText(code, 64) or "INTERNAL_ERROR"
+    return {
+        ok = false,
+        feature = feature,
+        requestId = requestId,
+        code = safeCode,
+        message = Protocol.message(safeCode),
+    }
+end
+
+function SecurityManager:purge()
+    local now = os.clock()
+    for _, cache in pairs(self.caches) do
+        cache:purge(now)
+    end
+end
+
+function SecurityManager:forgetPlayer(userId: number)
+    local key = tostring(userId)
+    self.limiters[key] = nil
+    self.environmentLimiters[key] = nil
+end
+
+return SecurityManager
+end
+
+__modules["Server.ServerConfig"] = function()
+--!nonstrict
+-- ============================================================================
+-- AUTHORIZED DEVELOPMENT SERVER ONLY
+-- ----------------------------------------------------------------------------
+-- Install this component only in an experience you own or are explicitly
+-- authorized to modify. The target third-party game's PlaceId is deliberately
+-- NOT allowlisted here. Adding someone else's PlaceId does not grant you
+-- permission to use these tools there.
+--
+-- To run in a local Studio playtest, explicitly set AllowStudio = true below.
+-- Published experiences must list their PlaceId and every tester UserId.
+-- Features stay locked when the allowlists are empty or invalid.
+-- ============================================================================
+
+local ServerConfig = {}
+
+ServerConfig.AllowStudio = false
+ServerConfig.AuthorizedPlaceIds = {}
+ServerConfig.TesterUserIds = {}
+
+ServerConfig.Features = {
+    Money = true,
+    Combat = true,
+    TargetVisualization = true,
+    ItemVisualization = true,
+    ATM = true,
+    Noclip = true,
+}
+
+ServerConfig.Limits = {
+    MoneyMaxDistance = 10000,
+    MoneyRespawnSeconds = 45,
+    MoneyValueMin = 5,
+    MoneyValueMax = 100,
+    ATMRange = 14,
+    ATMCooldownSeconds = 3,
+    ATMAllowMockCredits = true,
+    ATMTestCredit = 1,
+    ATMTestCreditCap = 25,
+    CombatRange = 100,
+    CombatDamage = 10,
+    CombatRespawnSeconds = 5,
+    NoclipMaxDuration = 60,
+    MockBalanceStart = 0,
+    MockBalanceMax = 100000,
+}
+
+ServerConfig.RateLimits = {
+    Environment = { burst = 4, refill = 1 },
+    Money = { burst = 8, refill = 4 },
+    ATM = { burst = 3, refill = 1.5 },
+    Combat = { burst = 8, refill = 4 },
+    Noclip = { burst = 3, refill = 1 },
+}
+
+ServerConfig.Idempotency = {
+    ttlSeconds = 60,
+    maxEntries = 500,
+}
+
+ServerConfig.Fixtures = {
+    Enabled = true,
+    FolderName = "AgamtrashDev",
+    OriginX = 16,
+    OriginY = 4,
+    OriginZ = 16,
+    MoneyCount = 10,
+    ItemCount = 6,
+    DummyCount = 3,
+    ATMCount = 2,
+}
+
+ServerConfig.DebugLogging = false
+
+local function isFinite(value: any): boolean
+    return type(value) == "number" and value == value and value ~= math.huge and value ~= -math.huge
+end
+
+local function idsAreNumeric(list: any): boolean
+    if type(list) ~= "table" then
+        return false
+    end
+    for _, value in ipairs(list) do
+        if not isFinite(value) or value % 1 ~= 0 or value <= 0 then
+            return false
+        end
+    end
+    return true
+end
+
+-- Returns (ok, issues). The server component fails closed if configuration is
+-- malformed rather than guessing at security-sensitive values.
+function ServerConfig.validate(): (boolean, { string })
+    local issues = {}
+
+    if type(ServerConfig.AllowStudio) ~= "boolean" then
+        table.insert(issues, "AllowStudio must be a boolean.")
+    end
+    if not idsAreNumeric(ServerConfig.AuthorizedPlaceIds) then
+        table.insert(issues, "AuthorizedPlaceIds must be an array of positive integer PlaceIds.")
+    end
+    if not idsAreNumeric(ServerConfig.TesterUserIds) then
+        table.insert(issues, "TesterUserIds must be an array of positive integer UserIds.")
+    end
+
+    if type(ServerConfig.Features) ~= "table" then
+        table.insert(issues, "Features must be a table.")
+    else
+        for _, feature in ipairs({ "Money", "Combat", "TargetVisualization", "ItemVisualization", "ATM", "Noclip" }) do
+            if type(ServerConfig.Features[feature]) ~= "boolean" then
+                table.insert(issues, "Features." .. feature .. " must be a boolean.")
+            end
+        end
+    end
+
+    local limits = ServerConfig.Limits
+    if type(limits) ~= "table" then
+        table.insert(issues, "Limits must be a table.")
+    else
+        local checks = {
+            { "MoneyMaxDistance", 100, 10000 },
+            { "MoneyRespawnSeconds", 5, 600 },
+            { "MoneyValueMin", 1, 1000 },
+            { "MoneyValueMax", 1, 10000 },
+            { "ATMRange", 1, 100 },
+            { "ATMCooldownSeconds", 0.5, 60 },
+            { "ATMTestCredit", 1, 100 },
+            { "ATMTestCreditCap", 1, 1000 },
+            { "CombatRange", 5, 500 },
+            { "CombatDamage", 1, 10000 },
+            { "CombatRespawnSeconds", 0.5, 60 },
+            { "NoclipMaxDuration", 5, 600 },
+            { "MockBalanceStart", 0, 1000000 },
+            { "MockBalanceMax", 0, 10000000 },
+        }
+        for _, check in ipairs(checks) do
+            local value = limits[check[1]]
+            if not isFinite(value) or value < check[2] or value > check[3] then
+                table.insert(issues, string.format("Limits.%s must be a number between %s and %s.", check[1], check[2], check[3]))
+            end
+        end
+        if type(limits.ATMAllowMockCredits) ~= "boolean" then
+            table.insert(issues, "Limits.ATMAllowMockCredits must be a boolean.")
+        end
+        if isFinite(limits.MoneyValueMin) and isFinite(limits.MoneyValueMax) and limits.MoneyValueMin > limits.MoneyValueMax then
+            table.insert(issues, "Limits.MoneyValueMin must not exceed MoneyValueMax.")
+        end
+        if isFinite(limits.MockBalanceStart) and isFinite(limits.MockBalanceMax) and limits.MockBalanceStart > limits.MockBalanceMax then
+            table.insert(issues, "Limits.MockBalanceStart must not exceed MockBalanceMax.")
+        end
+    end
+
+    local fixture = ServerConfig.Fixtures
+    if type(fixture) ~= "table" then
+        table.insert(issues, "Fixtures must be a table.")
+    else
+        if type(fixture.Enabled) ~= "boolean" then
+            table.insert(issues, "Fixtures.Enabled must be a boolean.")
+        end
+        for _, field in ipairs({ "MoneyCount", "ItemCount", "DummyCount", "ATMCount" }) do
+            local value = fixture[field]
+            if not isFinite(value) or value % 1 ~= 0 or value < 0 or value > 50 then
+                table.insert(issues, "Fixtures." .. field .. " must be an integer between 0 and 50.")
+            end
+        end
+    end
+
+    return #issues == 0, issues
+end
+
+return ServerConfig
+end
+
+__modules["Server.Init"] = function()
+--!nonstrict
+-- agamtrash.hub authorized development server component.
+-- This file creates only our own remotes and development fixtures. It does not
+-- inspect, hook, or communicate with a third-party game's systems.
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+
+-- Rojo turns a directory containing init.server.luau into a Script whose
+-- siblings become children of that Script. A manually placed script may instead
+-- sit inside the module folder. Support both layouts without guessing by name.
+local ServerConfig = __require("Server.ServerConfig")
+local configOk, configIssues = ServerConfig.validate()
+if not configOk then
+    warn("[agamtrash.hub] Server configuration is invalid. The component will not start.")
+    for _, issue in ipairs(configIssues) do
+        warn("[agamtrash.hub] " .. issue)
+    end
+    return
+end
+
+local Protocol = __require("Shared.Protocol")
+local Payloads = __require("Shared.Payloads")
+local Diagnostics = __require("Shared.Diagnostics")
+local MockLedger = __require("Shared.MockLedger")
+local CleanupManager = __require("Shared.CleanupManager")
+
+local SecurityManager = __require("Server.SecurityManager")
+local RequestRouter = __require("Server.RequestRouter")
+local MoneyService = __require("Server.MoneyService")
+local ATMService = __require("Server.ATMService")
+local CombatService = __require("Server.CombatService")
+local NoclipService = __require("Server.NoclipService")
+local DevFixtures = __require("Server.DevFixtures")
+
+local cleanup = CleanupManager.new("server")
+local logger = Diagnostics.new({
+    debug = ServerConfig.DebugLogging,
+    maxEntries = 300,
+    sink = function(level, text)
+        local prefix = "[agamtrash.hub/server] "
+        if level == "error" or level == "warn" then
+            warn(prefix .. text)
+        else
+            print(prefix .. text)
+        end
+    end,
+})
+
+logger:info(string.format("Starting protocol %d, server version %s.", Protocol.PROTOCOL, Protocol.SERVER_VERSION))
+
+local security = SecurityManager.new(ServerConfig, logger, RunService)
+local placeAuthorized = security:isPlaceAuthorized()
+local ledger = MockLedger.new(ServerConfig.Limits.MockBalanceStart, ServerConfig.Limits.MockBalanceMax)
+
+local fixtures = DevFixtures.new({ config = ServerConfig, logger = logger })
+if placeAuthorized then
+    local ok, err = pcall(function()
+        return fixtures:create()
+    end)
+    if not ok then
+        logger:error("Fixture creation failed: " .. tostring(err))
+    end
+else
+    logger:warn("This place is not in the server allowlist. Fixtures and feature services are locked.")
+end
+
+local moneyService = MoneyService.new({ config = ServerConfig, ledger = ledger, logger = logger })
+local atmService = ATMService.new({ config = ServerConfig, ledger = ledger, logger = logger })
+local combatService = CombatService.new({ config = ServerConfig, logger = logger })
+local noclipService = NoclipService.new({ config = ServerConfig, logger = logger })
+
+-- Per-player rate buckets and ATM test credits must not outlive the player in a
+-- long-running server. NoclipService owns its own PlayerRemoving restoration.
+cleanup:addConnection(Players.PlayerRemoving:Connect(function(player)
+    security:forgetPlayer(player.UserId)
+    atmService:forgetPlayer(player.UserId)
+end))
+
+-- Remotes are created before services are usable so clients always receive a
+-- structured handshake, even when authorization or configuration fails.
+local oldRemotes = ReplicatedStorage:FindFirstChild(Protocol.REMOTES_FOLDER)
+if oldRemotes then
+    oldRemotes:Destroy()
+end
+local remotes = Instance.new("Folder")
+remotes.Name = Protocol.REMOTES_FOLDER
+remotes.Parent = ReplicatedStorage
+
+local environmentRemote = Instance.new("RemoteFunction")
+environmentRemote.Name = Protocol.REMOTES.Environment
+environmentRemote.Parent = remotes
+
+local respondRemote = Instance.new("RemoteEvent")
+respondRemote.Name = Protocol.REMOTES.Respond
+respondRemote.Parent = remotes
+
+local featureRemoteNames = {
+    Money = Protocol.REMOTES.Money,
+    ATM = Protocol.REMOTES.ATM,
+    Combat = Protocol.REMOTES.Combat,
+    Noclip = Protocol.REMOTES.Noclip,
+}
+local featureRemotes = {}
+for feature, remoteName in pairs(featureRemoteNames) do
+    local remote = Instance.new("RemoteEvent")
+    remote.Name = remoteName
+    remote.Parent = remotes
+    featureRemotes[feature] = remote
+end
+
+local router = RequestRouter.new({ security = security, logger = logger, responseRemote = respondRemote })
+router:register("Money", Protocol.REMOTES.Money, Payloads.collect, function(player, payload, requestId)
+    return moneyService:collect(player, payload, requestId)
 end)
-if not __bootOk then
-    warn("[agamtrash.hub] Bundle failed: " .. tostring(__bootError))
+router:register("ATM", Protocol.REMOTES.ATM, Payloads.atm, function(player, payload, requestId)
+    return atmService:transact(player, payload, requestId)
+end)
+router:register("Combat", Protocol.REMOTES.Combat, Payloads.combat, function(player, payload, requestId)
+    return combatService:attack(player, payload, requestId)
+end)
+router:register("Noclip", Protocol.REMOTES.Noclip, Payloads.noclip, function(player, payload, requestId)
+    if payload.action == "enable" then
+        return noclipService:enable(player)
+    elseif payload.action == "disable" then
+        return noclipService:disable(player)
+    end
+    return noclipService:status(player)
+end)
+
+for feature, remote in pairs(featureRemotes) do
+    cleanup:addConnection(router:connect(remote, feature))
+end
+
+local FIXTURE_DEPENDENT = {
+    Money = true,
+    ATM = true,
+    Combat = true,
+    TargetVisualization = true,
+    ItemVisualization = true,
+}
+
+local function buildEnvironment(player: Player, forcedCode: string?): table
+    local decision = security:authorize(player)
+    local code = forcedCode or decision.code
+    local authorized = decision.authorized and forcedCode == nil
+    if forcedCode ~= nil then
+        authorized = false
+    end
+
+    local fixturesReady = fixtures:isReady()
+    local features = {}
+    for _, feature in ipairs(Protocol.FEATURES) do
+        local enabled = authorized
+            and security:isFeatureEnabled(feature)
+            and (not FIXTURE_DEPENDENT[feature] or fixturesReady)
+        features[feature] = enabled == true
+    end
+
+    return {
+        protocol = Protocol.PROTOCOL,
+        serverVersion = Protocol.SERVER_VERSION,
+        authorized = authorized,
+        code = code,
+        message = Protocol.message(code),
+        scope = authorized and decision.scope or "none",
+        features = features,
+        limits = {
+            moneyMaxDistance = ServerConfig.Limits.MoneyMaxDistance,
+            atmRange = ServerConfig.Limits.ATMRange,
+            atmCooldown = ServerConfig.Limits.ATMCooldownSeconds,
+            combatRange = ServerConfig.Limits.CombatRange,
+            noclipMaxDuration = ServerConfig.Limits.NoclipMaxDuration,
+        },
+        fixturesReady = fixturesReady,
+    }
+end
+
+local function onEnvironmentRequest(player: Player)
+    local allowed, retryAfter = security:consumeEnvironment(player)
+    if not allowed then
+        local snapshot = buildEnvironment(player, "ENVIRONMENT_RATE_LIMITED")
+        snapshot.retryAfter = retryAfter
+        return snapshot
+    end
+    return buildEnvironment(player)
+end
+
+environmentRemote.OnServerInvoke = function(player)
+    local ok, snapshot = pcall(onEnvironmentRequest, player)
+    if not ok then
+        logger:error("Environment handshake failed: " .. tostring(snapshot))
+        local fallback = buildEnvironment(player, "INTERNAL_ERROR")
+        return fallback
+    end
+    return snapshot
+end
+
+if placeAuthorized then
+    logger:info("Place authorization passed. Published worlds still require each tester in TesterUserIds.")
+else
+    logger:warn("Device environment is locked. Set AllowStudio=true for local Studio tests, or add this PlaceId and tester UserIds for a published test place.")
+end
+
+-- Keep the cleanup scope referenced for the lifetime of the server script.
+_G.__agamtrashServerCleanup = cleanup
+end
+
+local RunService = game:GetService("RunService")
+if RunService:IsServer() then
+    local __serverOk, __serverError = pcall(function()
+        __require("Server.Init")
+    end)
+    if not __serverOk then
+        warn("[agamtrash.hub] Server component failed: " .. tostring(__serverError))
+    end
+else
+    local __bootOk, __bootError = pcall(function()
+        local Boot = __require("Client.Boot")
+        local started, success, detail = pcall(Boot.start)
+        if not started then
+            warn("[agamtrash.hub] Boot failed: " .. tostring(success))
+        elseif not success then
+            warn("[agamtrash.hub] Boot stopped: " .. tostring(detail))
+        end
+    end)
+    if not __bootOk then
+        warn("[agamtrash.hub] Bundle failed: " .. tostring(__bootError))
+    end
 end
