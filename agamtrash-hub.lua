@@ -9869,6 +9869,7 @@ function UIController.new(runtime: any, library: any, options: any?): (any?, str
     self._itemCategory = nil
     self._controls = nil
     self._inputConnection = nil
+    self._visibilityBusy = false
 
     local ok, err = pcall(function()
         self:_createWindow()
@@ -9949,9 +9950,10 @@ function UIController:_syncWindowControls()
 end
 
 function UIController:_setWindowVisible(visible: boolean)
-    if self._destroyed then
+    if self._destroyed or self._visibilityBusy then
         return
     end
+    self._visibilityBusy = true
     task.spawn(function()
         local ok, err = pcall(function()
             if self._destroyed then
@@ -9962,12 +9964,17 @@ function UIController:_setWindowVisible(visible: boolean)
         if not ok then
             self:_internalError(err)
         end
+        -- Rayfield animates Hide/Unhide for 0.5s and silently ignores a second
+        -- call while its own debounce is active. Keep our controls locked for
+        -- the same window so a double click cannot leave them desynchronized.
+        task.wait(0.6)
+        self._visibilityBusy = false
         self:_syncWindowControls()
     end)
 end
 
 function UIController:_toggleWindow()
-    if self._destroyed then
+    if self._destroyed or self._visibilityBusy then
         return
     end
     self:_setWindowVisible(not self:_windowVisible())
