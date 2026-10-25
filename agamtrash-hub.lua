@@ -8905,6 +8905,23 @@ local NoclipDebug = __require("Client.NoclipDebug")
 local Runtime = {}
 Runtime.__index = Runtime
 
+-- Feature starts can fail because the whole environment is locked. Repeating the
+-- same paragraph for every toggle is noisy, so these codes collapse into one
+-- short notice per lock state; Settings > Environment keeps the full detail.
+local LOCK_CODES = {
+    SERVER_COMPONENT_MISSING = true,
+    REMOTE_MISSING = true,
+    ENVIRONMENT_NOT_READY = true,
+    SERVER_NOT_READY = true,
+    PLACE_NOT_AUTHORIZED = true,
+    TESTER_NOT_AUTHORIZED = true,
+    TESTER_ALLOWLIST_EMPTY = true,
+    NOT_AUTHORIZED = true,
+    FEATURE_DISABLED = true,
+    FIXTURES_NOT_READY = true,
+    ENVIRONMENT_RATE_LIMITED = true,
+}
+
 function Runtime.new(options: any?)
     local settings = options or {}
     local self = setmetatable({}, Runtime)
@@ -8912,6 +8929,7 @@ function Runtime.new(options: any?)
     self._ui = nil
     self._clientInfo = settings.clientInfo or {}
     self._environmentWasAuthorized = false
+    self._lastLockNotice = nil
 
     self.diagnostics = Diagnostics.new({
         maxEntries = 240,
@@ -9082,13 +9100,16 @@ function Runtime:_onEnvironmentChanged(snapshot: table?, previousCode: string?)
         self.diagnostics:debug("Environment changed: " .. snapshot.code)
         if not snapshot.authorized and self._environmentWasAuthorized then
             self:_stopGameplayModules("server authorization changed")
-            self:_notify("Environment locked", Protocol.message(snapshot.code))
+            self:_notifyLocked(snapshot.code)
         end
         self._environmentWasAuthorized = snapshot.authorized
+        if snapshot.authorized then
+            self._lastLockNotice = nil
+        end
     else
         if self._environmentWasAuthorized then
             self:_stopGameplayModules("server handshake lost")
-            self:_notify("Server unavailable", Protocol.message(previousCode or "SERVER_COMPONENT_MISSING"))
+            self:_notifyLocked(previousCode or "SERVER_COMPONENT_MISSING")
         end
         self._environmentWasAuthorized = false
     end
@@ -9105,9 +9126,33 @@ function Runtime:_notify(title: string, content: string)
     end
 end
 
+function Runtime:_notifyLocked(code: string?)
+    local key = code or "SERVER_COMPONENT_MISSING"
+    if self._lastLockNotice == key then
+        return
+    end
+    self._lastLockNotice = key
+
+    if key == "SERVER_COMPONENT_MISSING" or key == "REMOTE_MISSING" then
+        self:_notify("Features locked", "Server component not found. Features stay locked. Details: Settings > Environment.")
+    elseif key == "ENVIRONMENT_NOT_READY" or key == "SERVER_NOT_READY" then
+        self:_notify("Features locked", "The environment handshake is not ready yet. Try again in a moment.")
+    else
+        self:_notify("Features locked", Protocol.message(key) .. " Details: Settings > Environment.")
+    end
+end
+
+function Runtime:_notifyFailure(title: string, code: string?)
+    if code and LOCK_CODES[code] then
+        self:_notifyLocked(code)
+    else
+        self:_notify(title, Protocol.message(code))
+    end
+end
+
 function Runtime:_onAutoStopped(feature: string, code: string)
     self.diagnostics:warn(Protocol.FEATURE_LABELS[feature] .. " stopped: " .. tostring(code))
-    self:_notify(Protocol.FEATURE_LABELS[feature] or feature, Protocol.message(code))
+    self:_notifyFailure(Protocol.FEATURE_LABELS[feature] or feature, code)
     if self._ui and self._ui.onAutoStopped then
         pcall(self._ui.onAutoStopped, self._ui, feature, code)
     end
@@ -9172,7 +9217,7 @@ function Runtime:setAutoMoney(enabled: boolean): (boolean, string?)
     if enabled then
         local ok, reason = self.money:start()
         if not ok then
-            self:_notify("Money", Protocol.message(reason))
+            self:_notifyFailure("Money", reason)
         end
         return ok, reason
     end
@@ -9183,7 +9228,7 @@ end
 function Runtime:collectNearest(): (boolean, string?)
     local ok, reason = self.money:collectNearest()
     if not ok and reason ~= "NO_TARGET" and reason ~= "REMOTE_BUSY" then
-        self:_notify("Money", Protocol.message(reason))
+        self:_notifyFailure("Money", reason)
     elseif reason == "NO_TARGET" then
         self:_notify("Money", Protocol.message("NO_TARGET"))
     end
@@ -9194,7 +9239,7 @@ function Runtime:setCombat(enabled: boolean): (boolean, string?)
     if enabled then
         local ok, reason = self.combat:start()
         if not ok then
-            self:_notify("Combat", Protocol.message(reason))
+            self:_notifyFailure("Combat", reason)
         end
         return ok, reason
     end
@@ -9205,7 +9250,7 @@ end
 function Runtime:attackNearest(): (boolean, string?)
     local ok, reason = self.combat:attackNearest()
     if not ok and reason ~= "NO_TARGET" and reason ~= "REMOTE_BUSY" then
-        self:_notify("Combat", Protocol.message(reason))
+        self:_notifyFailure("Combat", reason)
     elseif reason == "NO_TARGET" then
         self:_notify("Combat", Protocol.message("NO_TARGET"))
     end
@@ -9216,7 +9261,7 @@ function Runtime:setTargetVisualization(enabled: boolean): (boolean, string?)
     if enabled then
         local ok, reason = self.targets:start()
         if not ok then
-            self:_notify("Target Visualization", Protocol.message(reason))
+            self:_notifyFailure("Target Visualization", reason)
         end
         return ok, reason
     end
@@ -9228,7 +9273,7 @@ function Runtime:setItemESP(enabled: boolean): (boolean, string?)
     if enabled then
         local ok, reason = self.items:start()
         if not ok then
-            self:_notify("Item ESP", Protocol.message(reason))
+            self:_notifyFailure("Item ESP", reason)
         end
         return ok, reason
     end
@@ -9240,7 +9285,7 @@ function Runtime:setATM(enabled: boolean): (boolean, string?)
     if enabled then
         local ok, reason = self.atm:start()
         if not ok then
-            self:_notify("ATM Test", Protocol.message(reason))
+            self:_notifyFailure("ATM Test", reason)
         end
         return ok, reason
     end
@@ -9251,7 +9296,7 @@ end
 function Runtime:atmInteractOnce(): (boolean, string?)
     local ok, reason = self.atm:interactOnce()
     if not ok and reason ~= "NO_TARGET" and reason ~= "REMOTE_BUSY" then
-        self:_notify("ATM Test", Protocol.message(reason))
+        self:_notifyFailure("ATM Test", reason)
     elseif reason == "NO_TARGET" then
         self:_notify("ATM Test", Protocol.message("NO_TARGET"))
     end
@@ -9263,7 +9308,7 @@ function Runtime:setNoclip(enabled: boolean): (boolean, string?)
         if response.ok then
             self:_notify("Noclip Debug", enabled and "Server enabled the debug session. Collision will be restored automatically." or "Server restored the original collision settings.")
         else
-            self:_notify("Noclip Debug", Protocol.message(response.code))
+            self:_notifyFailure("Noclip Debug", response.code)
         end
         if self._ui and self._ui.onNoclipState then
             pcall(self._ui.onNoclipState, self._ui, self.noclip:getStatus())
@@ -9273,7 +9318,7 @@ function Runtime:setNoclip(enabled: boolean): (boolean, string?)
     if enabled then
         local ok, reason = self.noclip:enable(callback)
         if not ok then
-            self:_notify("Noclip Debug", Protocol.message(reason))
+            self:_notifyFailure("Noclip Debug", reason)
             if self._ui and self._ui.onNoclipState then
                 pcall(self._ui.onNoclipState, self._ui, self.noclip:getStatus())
             end
@@ -9287,7 +9332,7 @@ function Runtime:setNoclip(enabled: boolean): (boolean, string?)
     end
     local ok, reason = self.noclip:disable(callback)
     if not ok then
-        self:_notify("Noclip Debug", Protocol.message(reason))
+        self:_notifyFailure("Noclip Debug", reason)
     end
     return ok, reason
 end
@@ -9751,7 +9796,6 @@ __modules["Client.UIController"] = function()
 --
 -- Labels and diagnostics are bounded and sanitized before they reach Rayfield.
 
-local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local UserInputService = game:GetService("UserInputService")
 
@@ -9773,57 +9817,6 @@ local UNLOAD_KEY = Enum.KeyCode.Delete
 
 local function text(value: any, maximum: number?): string
     return Validation.cleanText(tostring(value or ""), maximum or 240) or ""
-end
-
--- Rayfield's topbar icons are drawn by an executor-loaded asset and are too small
--- (or unreachable when the game locks the mouse) on some clients. This dedicated
--- ScreenGui keeps two large window controls outside that asset, above the hub.
-local function interfaceParent(): Instance?
-    if type(gethui) == "function" then
-        local ok, container = pcall(gethui)
-        if ok and typeof(container) == "Instance" then
-            return container
-        end
-    end
-    local ok, container = pcall(function()
-        return game:GetService("CoreGui")
-    end)
-    if ok and typeof(container) == "Instance" then
-        return container
-    end
-    local player = Players.LocalPlayer
-    if player then
-        return player:FindFirstChildOfClass("PlayerGui")
-    end
-    return nil
-end
-
-local function controlButton(parent: Instance, label: string, width: number, color: Color3): TextButton
-    local button = Instance.new("TextButton")
-    button.Name = label .. "Button"
-    button.Size = UDim2.fromOffset(width, 28)
-    button.BackgroundColor3 = color
-    button.BackgroundTransparency = 0.1
-    button.BorderSizePixel = 0
-    button.AutoButtonColor = true
-    button.Text = label
-    button.TextColor3 = Color3.fromRGB(240, 246, 255)
-    button.TextSize = 13
-    button.Font = Enum.Font.GothamBold
-    button.ZIndex = 2
-    button.Parent = parent
-
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 6)
-    corner.Parent = button
-
-    local stroke = Instance.new("UIStroke")
-    stroke.Color = Color3.fromRGB(70, 110, 160)
-    stroke.Thickness = 1
-    stroke.Transparency = 0.25
-    stroke.Parent = button
-
-    return button
 end
 
 local function dropdownValue(option: any): string?
@@ -9867,7 +9860,6 @@ function UIController.new(runtime: any, library: any, options: any?): (any?, str
     self._configSliders = {}
     self._configDropdowns = {}
     self._itemCategory = nil
-    self._controls = nil
     self._inputConnection = nil
     self._visibilityBusy = false
 
@@ -9877,7 +9869,6 @@ function UIController.new(runtime: any, library: any, options: any?): (any?, str
         self:_buildCombat(self._tabs.Combat)
         self:_buildMisc(self._tabs.Misc)
         self:_buildSettings(self._tabs.Settings)
-        self:_createWindowControls()
         self:_bindWindowHotkeys()
     end)
     if not ok then
@@ -9941,14 +9932,6 @@ function UIController:_windowVisible(): boolean
     return true
 end
 
-function UIController:_syncWindowControls()
-    local controls = self._controls
-    if not controls then
-        return
-    end
-    controls.toggle.Text = self:_windowVisible() and "Hide (Insert)" or "Show (Insert)"
-end
-
 function UIController:_setWindowVisible(visible: boolean)
     if self._destroyed or self._visibilityBusy then
         return
@@ -9969,7 +9952,6 @@ function UIController:_setWindowVisible(visible: boolean)
         -- the same window so a double click cannot leave them desynchronized.
         task.wait(0.6)
         self._visibilityBusy = false
-        self:_syncWindowControls()
     end)
 end
 
@@ -9978,82 +9960,6 @@ function UIController:_toggleWindow()
         return
     end
     self:_setWindowVisible(not self:_windowVisible())
-end
-
-function UIController:_createWindowControls()
-    local parent = interfaceParent()
-    if not parent then
-        return
-    end
-
-    local screen
-    local ok, err = pcall(function()
-        screen = Instance.new("ScreenGui")
-        screen.Name = "AgamtrashHubControls"
-        screen.ResetOnSpawn = false
-        screen.IgnoreGuiInset = true
-        screen.DisplayOrder = 1000000
-        screen.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-
-        local bar = Instance.new("Frame")
-        bar.Name = "Bar"
-        bar.AnchorPoint = Vector2.new(0.5, 0)
-        bar.Position = UDim2.new(0.5, 0, 0, 8)
-        bar.Size = UDim2.fromOffset(258, 36)
-        bar.BackgroundColor3 = Color3.fromRGB(16, 21, 28)
-        bar.BackgroundTransparency = 0.15
-        bar.BorderSizePixel = 0
-        bar.ZIndex = 1
-        bar.Parent = screen
-
-        local corner = Instance.new("UICorner")
-        corner.CornerRadius = UDim.new(0, 10)
-        corner.Parent = bar
-
-        local stroke = Instance.new("UIStroke")
-        stroke.Color = Color3.fromRGB(60, 80, 105)
-        stroke.Thickness = 1
-        stroke.Transparency = 0.2
-        stroke.Parent = bar
-
-        local layout = Instance.new("UIListLayout")
-        layout.FillDirection = Enum.FillDirection.Horizontal
-        layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
-        layout.VerticalAlignment = Enum.VerticalAlignment.Center
-        layout.Padding = UDim.new(0, 6)
-        layout.SortOrder = Enum.SortOrder.LayoutOrder
-        layout.Parent = bar
-
-        local toggle = controlButton(bar, "Hide (Insert)", 118, Color3.fromRGB(27, 48, 73))
-        toggle.LayoutOrder = 1
-        local close = controlButton(bar, "Close", 110, Color3.fromRGB(82, 30, 36))
-        close.LayoutOrder = 2
-
-        toggle.MouseButton1Click:Connect(function()
-            self:_toggleWindow()
-        end)
-        close.MouseButton1Click:Connect(function()
-            self:_requestUnload()
-        end)
-
-        screen.Parent = parent
-        self._controls = { screen = screen, toggle = toggle, close = close }
-    end)
-
-    if not ok then
-        if screen then
-            pcall(function()
-                screen:Destroy()
-            end)
-        end
-        self._controls = nil
-        pcall(function()
-            self._runtime:getDiagnosticsLogger():warn("Window controls unavailable: " .. Validation.truncate(err, 160))
-        end)
-        return
-    end
-
-    self:_syncWindowControls()
 end
 
 function UIController:_bindWindowHotkeys()
@@ -10400,7 +10306,7 @@ function UIController:_buildSettings(tab: any)
         tab,
         "windowControls",
         "Window controls",
-        "A floating Hide / Close bar stays available at the top of the screen. Insert or RightControl hides or shows the hub. Delete unloads it and cleans up every module."
+"Insert or RightControl hides or shows the hub. Delete unloads it and cleans up every module. These hotkeys work even when Rayfield's own topbar icons are hard to reach."
     )
     self:_button(tab, "Hide Hub (Insert)", function()
         self:_setWindowVisible(false)
@@ -10499,7 +10405,6 @@ function UIController:refreshStatus()
         self:_setStatus("noclipStatus", "Noclip status", snapshot.noclip)
         self:_setStatus("environmentStatus", "Environment", snapshot.environment .. "\n" .. snapshot.environmentDetail)
         self:_setStatus("moduleStatus", "Module status", snapshot.modules)
-        self:_syncWindowControls()
     end)
     if not ok then
         self._runtime:getDiagnosticsLogger():warn("Status refresh failed: " .. Validation.truncate(err, 160))
@@ -10568,12 +10473,6 @@ function UIController:destroy()
             self._inputConnection:Disconnect()
         end)
         self._inputConnection = nil
-    end
-    if self._controls then
-        pcall(function()
-            self._controls.screen:Destroy()
-        end)
-        self._controls = nil
     end
     pcall(self._runtime.cancelTask, self._runtime, STATUS_TASK)
     -- Destroy the window through Rayfield's own lifecycle. Boot also calls
